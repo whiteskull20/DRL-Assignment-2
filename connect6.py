@@ -1,19 +1,36 @@
 import sys
 import numpy as np
 import random
-
+import copy
+import math
+from collections import defaultdict
+from connect6_value import Connect6GameEnv, NTupleApproximator
+import pickle
+from tqdm import trange
+from connect6_mcts import MCTS, MCTS_Node
+import cProfile
 class Connect6Game:
     def __init__(self, size=19):
         self.size = size
         self.board = np.zeros((size, size), dtype=int)  # 0: Empty, 1: Black, 2: White
         self.turn = 1  # 1: Black, 2: White
         self.game_over = False
+        self.approximator = NTupleApproximator(19, 8)
+        
+        self.approximator.weights = pickle.load(open('approximator_6_epsgreed.weights.backup','rb'))
+        self.approximator.weights = defaultdict(lambda: 0.0,{tuple(int(_) for _ in k): v for k,v in self.approximator.weights.items()})
+
+        print(sorted(self.approximator.weights.items(),key=lambda x:x[1],reverse=True)[:20],file=sys.stderr)
+        print(sorted(self.approximator.weights.items(),key=lambda x:x[1],reverse=True)[-20:],file=sys.stderr)
+        self.mcts = MCTS( self.approximator, iterations=5000, simulation_batch=1, rollout_depth=0, exploration_constant=1.41, gamma=0.999)
+        self.remain_move = 1
 
     def reset_board(self):
         """Clears the board and resets the game."""
         self.board.fill(0)
         self.turn = 1
         self.game_over = False
+        self.remain_move = 1
         print("= ", flush=True)
     def set_board_size(self, size):
         """Sets the board size and resets the game."""
@@ -21,6 +38,7 @@ class Connect6Game:
         self.board = np.zeros((size, size), dtype=int)
         self.turn = 1
         self.game_over = False
+        self.remain_move = 1
         print("= ", flush=True)
     def check_win(self):
         """Checks if a player has won.
@@ -65,7 +83,6 @@ class Connect6Game:
         if self.game_over:
             print("? Game over")
             return
-
         stones = move.split(',')
         positions = []
 
@@ -94,24 +111,69 @@ class Connect6Game:
 
         for row, col in positions:
             self.board[row, col] = 1 if color.upper() == 'B' else 2
-
-        self.turn = 3 - self.turn
+        self.remain_move -= len(stones)
+        if self.remain_move == 0:
+            self.turn = 3 - self.turn
+            self.remain_move = 2
         print('= ', end='', flush=True)
 
     def generate_move(self, color):
         """Generates a random move for the computer."""
+        profiler = cProfile.Profile()
+        profiler.enable()
+        estimate = self.approximator.value(self.board,self.turn)
+        print("Current estimate =",estimate,file=sys.stderr)
         if self.game_over:
             print("? Game over")
             return
-
-        empty_positions = [(r, c) for r in range(self.size) for c in range(self.size) if self.board[r, c] == 0]
-        selected = random.sample(empty_positions, 1)
-        move_str = ",".join(f"{self.index_to_label(c)}{r+1}" for r, c in selected)
+        env = Connect6GameEnv(self.size)
+        env.board = self.board
+        env.turn = self.turn
         
-        self.play_move(color, move_str)
-
-        print(f"{move_str}\n\n", end='', flush=True)
-        print(move_str, file=sys.stderr)
+        root = MCTS_Node(self.remain_move, env.turn)
+        # Run multiple simulations to build the MCTS tree
+        expansion = defaultdict(int)
+        for _ in trange(self.mcts.iterations):
+            expansion[self.mcts.run_simulation(root,env,self.board,self.turn,estimate)] += 1
+        print("Expansion Count:",expansion,file=sys.stderr)
+        maxval = -1e10
+        action = None
+        for c in root.children.values():
+            if c.visits == 0:
+                continue
+            w = -1 if c.turn != root.turn else 1
+            if maxval < w*c.total_reward / c.visits:
+                maxval = w*c.total_reward / c.visits
+                action = c.action
+        #print(self.board,file=sys.stderr)
+        #print('',file=sys.stderr)
+        print(action,root.children[action].total_reward/root.children[action].visits,root.children[action].turn,root.move_left, root.turn, file=sys.stderr)
+        '''
+        legal_moves = env.get_legal_moves()
+        if not legal_moves:
+            print("? Game over")
+            return
+        next_values = []
+        for a in legal_moves:
+            sim_env = copy.deepcopy(env)
+            sim_state , win = sim_env.step(a)
+            if win == self.turn:
+                next_values.append(1000000000)
+            elif win != 0:
+                next_values.append(-1000000000)
+            else:
+                next_values.append(self.approximator.value(sim_state,self.turn))
+            #print(a,next_values[-1],file=sys.stderr)
+        maxval = np.max(next_values)
+        #print(maxval,file=sys.stderr)
+        action = (legal_moves[random.choice([a for a, v in enumerate(next_values) if v == maxval])])'''
+        self.play_move(color, action)
+        #print(action,file=sys.stderr)
+        print(f"{action}\n\n", end='', flush=True)
+        
+        
+        profiler.disable()
+        profiler.dump_stats(f"profile.prof")
         return
     def show_board(self):
         """Displays the board as text."""
@@ -171,16 +233,14 @@ class Connect6Game:
     def run(self):
         """Main loop that reads GTP commands from standard input."""
         while True:
-            try:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-                self.process_command(line)
-            except KeyboardInterrupt:
+            line = sys.stdin.readline()
+            if not line:
                 break
-            except Exception as e:
-                print(f"? Error: {str(e)}")
+            self.process_command(line)
 
 if __name__ == "__main__":
     game = Connect6Game()
+    
     game.run()
+
+
