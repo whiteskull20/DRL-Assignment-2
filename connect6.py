@@ -9,6 +9,16 @@ import pickle
 from tqdm import trange
 from connect6_mcts import MCTS, MCTS_Node
 import cProfile
+import hashlib
+import time
+hash_table = {}
+def GetNode(state):
+    arr_contiguous = np.ascontiguousarray(state)
+    hash_value = hashlib.md5(arr_contiguous.tobytes()).hexdigest()
+    if hash_value in hash_table:
+        return hash_table[hash_value]
+    return None
+
 class Connect6Game:
     def __init__(self, size=19):
         self.size = size
@@ -17,12 +27,12 @@ class Connect6Game:
         self.game_over = False
         self.approximator = NTupleApproximator(19, 8)
         
-        self.approximator.weights = pickle.load(open('approximator_6_epsgreed.weights.backup','rb'))
+        self.approximator.weights = pickle.load(open('approximator_6_epsgreed.weights','rb'))
         self.approximator.weights = defaultdict(lambda: 0.0,{tuple(int(_) for _ in k): v for k,v in self.approximator.weights.items()})
 
         print(sorted(self.approximator.weights.items(),key=lambda x:x[1],reverse=True)[:20],file=sys.stderr)
         print(sorted(self.approximator.weights.items(),key=lambda x:x[1],reverse=True)[-20:],file=sys.stderr)
-        self.mcts = MCTS( self.approximator, iterations=5000, simulation_batch=1, rollout_depth=0, exploration_constant=1.41, gamma=0.999)
+        self.mcts = MCTS( self.approximator, iterations=60, simulation_batch=60, rollout_depth=2, exploration_constant=1.41, gamma=0.999)
         self.remain_move = 1
 
     def reset_board(self):
@@ -31,6 +41,7 @@ class Connect6Game:
         self.turn = 1
         self.game_over = False
         self.remain_move = 1
+        hash_table = {}
         print("= ", flush=True)
     def set_board_size(self, size):
         """Sets the board size and resets the game."""
@@ -39,6 +50,7 @@ class Connect6Game:
         self.turn = 1
         self.game_over = False
         self.remain_move = 1
+        hash_table = {}
         print("= ", flush=True)
     def check_win(self):
         """Checks if a player has won.
@@ -130,11 +142,18 @@ class Connect6Game:
         env.board = self.board
         env.turn = self.turn
         
-        root = MCTS_Node(self.remain_move, env.turn)
+        root = GetNode(self.board)
+        if root is None:
+            root = MCTS_Node(self.remain_move, env.turn)
+        else:
+            root.parent = None
         # Run multiple simulations to build the MCTS tree
         expansion = defaultdict(int)
-        for _ in trange(self.mcts.iterations):
+        starttime = time.time()
+        i = 0
+        while time.time() - starttime < 5 or i < self.mcts.iterations: # use additional time if possible
             expansion[self.mcts.run_simulation(root,env,self.board,self.turn,estimate)] += 1
+            i += 1
         print("Expansion Count:",expansion,file=sys.stderr)
         maxval = -1e10
         action = None

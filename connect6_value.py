@@ -221,7 +221,24 @@ class Connect6GameEnv:
                 if sum([1 for x in l if self.board[x] == 2]) == 6: 
                     return 2
         return 0
-
+    def check_instant_win(self,move_left,position=None):
+        """Checks if a player has instant win
+        Returns:
+        0 - No winner yet
+        1 - Black wins
+        2 - White wins
+        """
+        if len(position) == 0:
+            position = [(i//19,i%19) for i in range(19*19) if self.board[i//19,i%19] == self.turn]
+        threat = []
+        for p in position:
+            for l in line_table[p]:
+                f = [self.board[x] for x in l]
+                cnt1 = sum([1 for x in f if x == self.turn])
+                cnt2 = sum([1 for x in f if x == 3-self.turn])
+                if cnt1 >= 6-move_left and cnt2 == 0:
+                    threat += [l[i] for i in range(6) if (f[max(i-1,0)] != 0 or f[min(i+1,5)] != 0) and f[i] == 0 ]
+        return list(set(threat))
     def index_to_label(self, col):
         """Converts column index to letter (skipping 'I')."""
         return chr(ord('A') + col + (1 if col >= 8 else 0))  # Skips 'I'
