@@ -542,9 +542,17 @@ def td_learning(env, approximator, num_episodes=50000, alpha=0.01, gamma=0.99, e
     return final_scores
 
 
-# TODO: Define your own n-tuple patterns
-
+import requests
 approximator = NTupleApproximator(board_size=4)
+def download_public_file(file_url, destination_path):
+    response = requests.get(file_url)
+    response.raise_for_status()  # Ensure the request was successful
+    
+    with open(destination_path, 'wb') as file:
+        file.write(response.content)
+    print(f"File downloaded successfully to {destination_path}")
+download_public_file('https://drive.google.com/file/d/1YzHJwp5Kx8F0ueHXOALY44Zz4KCRclcr/view?usp=sharing','approximator.weights')
+approximator.weights = pickle.load(open('approximator.weights','rb'))
 #final_scores = td_learning(env, approximator, num_episodes=10000, alpha=0.1, gamma=1, epsilon=0)
 
 def get_action(state, score):
