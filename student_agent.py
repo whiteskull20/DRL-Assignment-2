@@ -240,7 +240,7 @@ from tqdm import trange
 # except for the rollout phase, which now incorporates the approximator.
 
 # Node for TD-MCTS using the TD-trained value approximator
-def step_chance(env,action):
+def step_half(env,action):
     """Execute one action, returns all possible board configuration. (board, p , done)"""
     self = copy.deepcopy(env)
     if action == 0:
@@ -253,24 +253,11 @@ def step_chance(env,action):
         moved = self.move_right()
     else:
         moved = False
-
     self.last_move_valid = moved  # Record if the move was valid
-    config = []
-    pconfig = []
-    if moved:
-        empty_cells = list(zip(*np.where(self.board == 0)))
-        P = 1/len(empty_cells)
-        for x,y in empty_cells:
-            self.board[x,y] = 2
-            config.append(self.board.copy())
-            pconfig.append(0.9*P)
-            self.board[x,y] = 4
-            config.append(self.board.copy())
-            pconfig.append(0.1*P)
-            self.board[x,y] = 0
-    return config, pconfig
+    return self.board,self.score
+    
 class TD_MCTS_Node:
-    def __init__(self,env, score, parent=None, action=None, chance=True,prob=1):
+    def __init__(self, score,env=None,state=None, parent=None, action=None, chance=True,value=0):
         """
         state: current board state (numpy array)
         score: cumulative score at this node
@@ -281,25 +268,21 @@ class TD_MCTS_Node:
         self.parent = parent
         self.action = action
         self.children = {}
-        self.visits = 0
+        self.visits = 0.0 # no division by zero
         self.total_reward = 0.0
         self.chance = chance # whether it is chance node
-        self.state = None
-        self.prob = prob
+        self.expanded = False 
+        self.value = value # value estimate
+        self.untried_actions = []
         if self.chance:
-            self.config, self.pconfig = step_chance(env,action)
-            env2 = copy.deepcopy(env)
-            for i in range(len(self.config)):
-                env2.state = self.config[i]
-                self.children[i] = TD_MCTS_Node(env2,score,parent=self,chance=False,prob=self.pconfig[i])
+            self.state = state
         else:
-            # List of untried actions based on the current state's legal moves
-            self.untried_actions = [a for a in range(4) if env.is_move_legal(a)]
             self.state = env.board.copy()
+            self.untried_actions = [a for a in range(4) if env.is_move_legal(a)]
+            
 
     def fully_expanded(self):
-        # A node is fully expanded if no legal actions remain untried.
-        return len(self.untried_actions) == 0
+        return self.expanded
 
 
 # TD-MCTS class utilizing a trained approximator for leaf evaluation
@@ -311,6 +294,7 @@ class TD_MCTS:
         self.c = exploration_constant
         self.rollout_depth = rollout_depth
         self.gamma = gamma
+        self.normalizer = 30000 # normalize approximator values
 
     def create_env_from_state(self, state, score):
         # Create a deep copy of the environment with the given state and score.
@@ -319,19 +303,20 @@ class TD_MCTS:
         new_env.score = score
         return new_env
 
-    def select_child(self, node):
+    def select_child(self, node,start_score):
         # TODO: Use the UCT formula: Q + c * sqrt(log(parent.visits)/child.visits) to select the best child.
+        if node.untried_actions:
+            action = random.choice(node.untried_actions)
+            node.untried_actions.remove(action)
+            return node.children[action]
         maxchild = None
         maxucb = -10000
-        if not node.chance: # sample by UCB
-            for c in node.children.values():
-                ucb = c.total_reward / c.visits + self.c * math.sqrt(math.log(node.visits) / c.visits)
-                if ucb > maxucb:
-                    maxucb = ucb
-                    maxchild = c
-            return maxchild
-        else: # sample by pconfig
-            return node.children[random.choices(len(self.config),self.pconfig,k=1)]
+        for c in node.children.values():
+            ucb = (c.total_reward / c.visits - start_score) / self.normalizer + self.c * math.sqrt(math.log(node.visits) / c.visits)
+            if ucb > maxucb:
+                maxucb = ucb
+                maxchild = c
+        return maxchild
 
     def rollout(self, sim_env, depth):
         sim_env = copy.deepcopy(sim_env)
@@ -350,44 +335,58 @@ class TD_MCTS:
             node.visits += 1
             node.total_reward += reward
             node = node.parent
-
-
+    def tile_to_index(self, tile):
+        """
+        Converts tile values to an index for the lookup table.
+        """
+        if tile == 0:
+            return 0
+        else:
+            return int(math.log(tile, 2))
+    def board_hash(self,board):
+        return sum([self.tile_to_index(board[i//4][i%4]) << (i*5) for i in range(16)])
     def run_simulation(self, root,state):
+        depth = 0
         node = root
         sim_env = self.create_env_from_state(state,node.score)
-        while node.fully_expanded():
-            node = self.select_child(node) #chance node
-            node = self.select_child(node) #non chance node
-        sim_env = self.create_env_from_state(node.state,node.score)   
-        # TODO: Expansion: if the node has untried actions, expand one.
-        if node.untried_actions:
-            action = random.choice(node.untried_actions)
-            sim_env2 = copy.deepcopy(sim_env)
-            state, reward, done, _ = sim_env2.step(action) #simulate step just to get the reward
-            if done: # terminal, count as 1 simulation
-                self.backpropagate(node, reward)
-            else:
-                node.children[action] = TD_MCTS_Node(sim_env,reward, parent=node, action=action,chance=True) # create chance node
-                node.untried_actions.remove(action)
-                node = self.select_child(node.children[action]) # sample one state
-                sim_env = self.create_env_from_state(node.state,node.score)
-        # Rollout: Simulate a random game from the expanded node.
-        rollout_reward = self.rollout(sim_env, self.rollout_depth)
+        start_score = node.score
+        done = False
+        while node.expanded:
+            node = self.select_child(node,start_score) #step to chance node
+            if not node.expanded:
+                break
+            state, score, done, _ = sim_env.step(node.action) # sample 1 afterstate
+            idx = self.board_hash(state)
+            if idx not in node.children: # extend if not visited
+                node.children[idx] = TD_MCTS_Node(score,env=sim_env, parent=node, action=idx,chance=False)
+            node = node.children[idx] # non chance node
+            depth += 1
+        if not done: # not terminal, expand
+            node.expanded = True
+            if node.chance: # chance node
+                self.backpropagate(node,node.value + node.score) # propogate with already calculated value
+            else: # non chance node
+                rollout_reward = 0
+                for action in [a for a in range(4) if sim_env.is_move_legal(a)]:
+                    state,reward = step_half(sim_env,action) # without adding random tiles
+                    node.children[action] = TD_MCTS_Node(reward,state=state, parent=node, action=action,chance=True,value=self.approximator.value(state)) # create chance node
+                    rollout_reward = max(rollout_reward,node.children[action].value + reward)
+                self.backpropagate(node,rollout_reward)
+        else:
+            self.backpropagate(node, sim_env.score)
+        return depth
         # Backpropagate the obtained reward.
-        self.backpropagate(node, rollout_reward)
+        
 
     def best_action_distribution(self, root):
         # Compute the normalized visit count distribution for each child of the root.
-        total_visits = sum(child.visits for child in root.children.values())
-        distribution = np.zeros(4)
-        best_visits = -1
-        best_action = None
+        best_reward = 0
+        best_action = 0
         for action, child in root.children.items():
-            distribution[action] = child.visits / total_visits if total_visits > 0 else 0
-            if child.visits > best_visits:
-                best_visits = child.visits
+            if  child.total_reward / child.visits > best_reward:
+                best_reward = child.total_reward / child.visits
                 best_action = action
-        return best_action, distribution
+        return best_action
 
 
 def rot(coord,k):
@@ -471,76 +470,6 @@ class NTupleApproximator:
             self.weights[idx//8][f] += alpha * delta / N
             idx += 1
 
-def td_learning(env, approximator, num_episodes=50000, alpha=0.01, gamma=0.99, epsilon=0.1):
-    """
-    Trains the 2048 agent using TD-Learning.
-
-    Args:
-        env: The 2048 game environment.
-        approximator: NTupleApproximator instance.
-        num_episodes: Number of training episodes.
-        alpha: Learning rate.
-        gamma: Discount factor.
-        epsilon: Epsilon-greedy exploration rate.
-    """
-    final_scores = []
-    success_flags = []
-    delta_avg = []
-    for episode in trange(num_episodes):
-        state = env.reset()
-        state = state.copy()
-        trajectory = []  # Store trajectory data if needed
-        previous_score = 0
-        done = False
-        max_tile = np.max(state)
-        while not done:
-            legal_moves = [a for a in range(4) if env.is_move_legal(a)]
-            if not legal_moves:
-                break
-            # TODO: action selection
-            # Note: TD learning works fine on 2048 without explicit exploration, but you can still try some exploration methods.
-            if random.random() < epsilon:
-                action = random.choice(legal_moves)
-            else:
-                next_values = []
-                for a in legal_moves:
-                  sim_env = copy.deepcopy(env)
-                  sim_env.board = state.copy()
-                  sim_env.score = previous_score
-                  sim_state , sim_score, _, _ = sim_env.step(a)
-                  next_values.append(sim_score-previous_score+gamma*approximator.value(sim_state))
-                maxval = np.max(next_values)
-                action = legal_moves[random.choice([a for a, v in enumerate(next_values) if v == maxval])]
-            next_state, new_score, done, _ = env.step(action)
-            incremental_reward = new_score - previous_score
-            previous_score = new_score
-            max_tile = max(max_tile, np.max(next_state))
-            # TODO: Store trajectory or just update depending on the implementation
-            trajectory.append((state,incremental_reward,next_state.copy()))
-            # TODO: TD-Learning update
-            state = next_state
-            state = state.copy()
-        #print(trajectory)
-        # TODO: If you are storing the trajectory, consider updating it now depending on your implementation.
-        delta_sum = 0
-        for state, reward, next_state in reversed(trajectory):
-            delta = reward + gamma * approximator.value(next_state) - approximator.value(state)
-            delta_sum += delta
-            approximator.update(state, delta, alpha)
-        delta_avg.append(delta_sum/len(trajectory))
-        final_scores.append(env.score)
-        success_flags.append(1 if max_tile >= 2048 else 0)
-        if (episode + 1) % 100 == 0:
-            avg_score = np.mean(final_scores[-100:])
-            success_rate = np.sum(success_flags[-100:]) / 100
-            avg_delta = np.mean(delta_avg[-100:])
-            print(f"Episode {episode+1}/{num_episodes} | Avg Score: {avg_score:.2f} | Success Rate: {success_rate:.2f} | Avg delta: {avg_delta}")
-        if (episode + 1) % 10000 == 0:
-          # Backup the approximator's weights
-          with open('approximator_6.weights', 'wb') as f: # backup in case of failure
-              pickle.dump(approximator.weights, f)
-    return final_scores
-
 
 import requests
 approximator = NTupleApproximator(board_size=4)
@@ -550,8 +479,10 @@ def download_public_file(file_url, destination_path):
     
     with open(destination_path, 'wb') as file:
         file.write(response.content)
-    print(f"File downloaded successfully to {destination_path}")
-download_public_file('https://drive.google.com/file/d/1YzHJwp5Kx8F0ueHXOALY44Zz4KCRclcr/view?usp=sharing','approximator.weights')
+    #print(f"File downloaded successfully to {destination_path}")
+import os
+if not os.path.isfile('approximator.weights'):
+    download_public_file('https://drive.usercontent.google.com/download?id=1YzHJwp5Kx8F0ueHXOALY44Zz4KCRclcr&export=download&authuser=0&confirm=t&uuid=7b9a2567-1de1-491b-b319-3ce6105f862b&at=APcmpoy_i9t4xopBTuHlrgFo6s-T%3A1744656061111','approximator.weights')
 approximator.weights = pickle.load(open('approximator.weights','rb'))
 #final_scores = td_learning(env, approximator, num_episodes=10000, alpha=0.1, gamma=1, epsilon=0)
 
@@ -562,16 +493,31 @@ def get_action(state, score):
     legal_moves = [a for a in range(4) if env.is_move_legal(a)]
     next_values = []
     previous_score = env.score
-    for a in legal_moves:
-      sim_env = copy.deepcopy(env)
-      sim_env.board = state.copy()
-      sim_env.score = previous_score
-      sim_env.step(a)
-      next_values.append(sim_env.score-previous_score+approximator.value(sim_env.board))
-    maxval = np.max(next_values)
-    action = legal_moves[random.choice([a for a, v in enumerate(next_values) if v == maxval])]
-    return action
+    td_mcts = TD_MCTS(env, approximator, iterations=100, exploration_constant=1.41, rollout_depth=5, gamma=1)
+    root = TD_MCTS_Node(env.score,env=env,parent=None,chance=False)
     
-    # You can submit this random agent to evaluate the performance of a purely random strategy.
+    expansion = defaultdict(int)
+    for _ in range(td_mcts.iterations):
+        expansion[td_mcts.run_simulation(root,state)] += 1
+    #print(expansion)
+    
+    # Select the best action (based on highest visit count)
+    best_act = td_mcts.best_action_distribution(root)
+    return best_act
+
+if __name__ == "__main__":
+    avg = 0
+    for i in range(10):
+        env = Game2048Env()
+        state = env.reset()
+        done = False
+        score = 0
+        while not done:
+            state,score,done,_ = env.step(get_action(state,score))
+            print(score, end="\r")
+        print("Final score:",score)
+        avg += score
+    print("Average: ",avg/10)
+
 
 
